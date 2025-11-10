@@ -1,0 +1,809 @@
+--[[
+TIMEBOMB DUELS — Autopilot (Yaw + Custom VG Pathfinder + Corner/Wedge Solver + Boundary Follow)
+v44_ARMGUARD_TIMER_GUARDPLUS
+
+Patch base: v44_WEDGE_SMOOTH_BF + ARM-GUARD-TIMER
+Changes in this GuardPlus patch:
+• Stronger right‑arm bomb guarding with predictive avoidance of enemy arms & HRP.
+• Instant “panic guard” when enemy intersects right‑side cone or is about to tag HRP.
+• Smoother orbit while guarding; no unintended right‑arm lean into enemy.
+• Deliver phase (≤2s) aggressively closes distance and aligns right arm toward enemy.
+• AutoRotate safety: AutoRotate disabled while enabled; re‑enabled when toggled off.
+• Heavy debug tags (STEER/GUARD/THREAT/BOUND/PLAN/MOVE/BOMB/FREE).
+
+Toggle: R (movement+aim). F8 toggles debug spam.
+]]
+
+--// Services
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+local LP               = Players.LocalPlayer
+
+--// Debug
+local DBG = { on = true, gate = 0.08 }
+local _lastTagT = {}
+local function now() return tick() end
+local function tagprint(tag, ...)
+    if not DBG.on then return end
+    local t = now(); local lt = _lastTagT[tag] or -1e9
+    if (t - lt) >= DBG.gate then _lastTagT[tag] = t; print(("[TB-AI v44+ %s]"):format(tag), ...) end
+end
+local function once(tag, ...) if DBG.on and _lastTagT[tag]==nil then _lastTagT[tag]=now(); print(("[TB-AI v44+ %s]"):format(tag), ...) end end
+local function oops(where, msg) warn(("[TB-AI v44+ ERROR %s] %s"):format(where, tostring(msg))) end
+
+--// Config
+local CFG = {
+  -- Yaw / look-ahead (higher look-ahead = smoother arcs; cut corners cleanly)
+  MaxYawDPS        = 13000,  -- huge but safe; keep yaw snappy
+  LookAheadMin     = 8.2,    -- ↑ from 7.0 to reduce micro-jitter near obstacles
+  LookAheadMax     = 12.6,
+  ThreatPad = 0.35,    -- longer look yields smoother S-curves
+
+  -- Collision envelope (slightly “fatter” to prevent brushing the L-walls)
+  AgentRadius      = 1.85,   -- 1.6 → 1.85 helps avoid grazing and corner nibs
+  InflateEps       = 0.12,
+  BrickExtra       = 0.65,   -- 0.55 → 0.65: more clearance on interior “L” bricks
+  WallExtra        = 0.30,   -- 0.25 → 0.30: safer near big room walls
+
+  -- Planner cadence (replan when it matters, not every tick)
+  ReplanMin        = 0.28,   -- 0.35 → 0.28: a hair more responsive
+  ReplanMax        = 0.85,
+
+  -- Corner smoothing (fillet the VG corners more aggressively)
+  FilletExtra      = 1.05,   -- 0.75 → 1.05: bigger arcs = no stall at inside corners
+  ExtendAfterCorner= 1.00,
+
+  -- Pure pursuit / “carrot” (farther carrot = smoother; never stalls)
+  CarrotDist       = 9.8,    -- 8.5 → 9.8: reduces zig‑zag & box‑paths
+  CarrotLoSTryStep = 1.20,
+  MoveStep         = 5.2,    -- 4.2 → 5.2: bigger forward set keeps velocity up
+  MinProgress      = 0.045,  -- 0.03 → 0.045: faster breakout if progress stalls
+
+  -- Repulsion & probe steering (keeps you off faces without “magnet hugging”)
+  RepelRadius      = 9.5,    -- 8.0 → 9.5: sense walls earlier
+  RepelGain        = 0.55,   -- 0.70 → 0.55: less “sticky” against L-walls
+  ProbeLen         = 8.8,    -- 7.0 → 8.8: peek further ahead
+  ProbeBias        = 0.42,   -- 0.35 → 0.42: stronger side-step when probing
+
+  -- Boundary follower (apex handling + hysteresis so it doesn’t flip flop)
+  FaceStickR       = 2.25,   -- 2.0 → 2.25: engage boundary helper a bit sooner
+  CornerStickR     = 2.55,   -- 2.1 → 2.55: detect “stuck at apex” earlier
+  EscapePulseSec   = 0.38,   -- 0.35 → 0.38: slightly longer escape pulse
+  FanRays          = 24,     -- 18 → 24: denser ray fan when wedged
+  FanLen           = 12.8,   -- 10 → 12.8: reach around longer L corridors
+  PathHysteresisS  = 0.55,   -- 0.85 → 0.55: quicker side-lock refresh (less circling)
+
+  -- “Mind” distances (how far to hover when neither has bomb)
+  DesiredRange     = 4.0,
+  KiteMinRange     = 11.5,   -- 12 → 11.5: a touch tighter for faster re-engage
+  KiteMaxRange     = 18.0,   -- 20 → 18: avoid wide loops
+
+  -- Bomb & guarding (harder right‑arm protection + predictive bias)
+  BombEps          = 0.05,
+  DeliverThreshold = 2.00,   -- keep this at 2s: turn-in and pass
+  GuardPredictMin  = 0.22,   -- 0.18 → 0.22: slightly longer lookahead
+  GuardPredictMax  = 0.40,
+  GuardConeCos     =  math.cos(math.rad(70)),   -- 0.35 → 0.40: anticipate fast sprints
+  GuardMinAngleDot = -0.55,
+    -- -0.35 → -0.55: RIGHT must point further away in guard
+
+  -- Movement reliability
+  TryUnanchor      = true,
+  UseMoveFallback  = true,
+}
+
+--// Math helpers
+local function planar(v) return Vector3.new(v.X,0,v.Z) end
+local function norm(v) local m=v.Magnitude; if m<1e-6 then return Vector3.new(0,0,0) end; return v/m end
+local function clamp(x,a,b) return math.max(a, math.min(b,x)) end
+local function sgn(x) return (x>=0) and 1 or -1 end
+
+-- yaw toward point
+local function yawTo(hrp, lookPoint, dt, bias)
+    local ok,err = pcall(function()
+        local p=hrp.Position
+        local tcf=CFrame.lookAt(p, Vector3.new(lookPoint.X, p.Y, lookPoint.Z))
+        local _,ty=tcf:ToOrientation(); local _,cy=hrp.CFrame:ToOrientation()
+        local d=(ty-cy+math.pi)%(2*math.pi)-math.pi
+        local mult = bias and clamp(bias,0.25,1.0) or 1.0
+        local step=math.rad(CFG.MaxYawDPS*mult)*dt
+        hrp.CFrame = CFrame.new(p) * CFrame.Angles(0, math.clamp(d,-step,step)+cy, 0)
+    end)
+    if not ok then oops("yawTo", err) end
+end
+
+-- 2D segment vs AABB ----------------------------------------------------------
+local function segHitsAABB(p0,p1,bmin,bmax)
+    local x0,z0=p0.X,p0.Z; local x1,z1=p1.X,p1.Z
+    local dx,dz=x1-x0,z1-z0
+    local t0,t1=0,1
+    local function axis(p,dp,mn,mx)
+        if math.abs(dp)<1e-8 then return (p>=mn and p<=mx) end
+        local inv=1/dp; local tmin=(mn-p)*inv; local tmax=(mx-p)*inv
+        if tmin>tmax then tmin,tmax=tmax,tmin end
+        t0=math.max(t0,tmin); t1=math.min(t1,tmax); return t0<=t1
+    end
+    if not axis(x0,dx,bmin.X,bmax.X) then return false end
+    if not axis(z0,dz,bmin.Z,bmax.Z) then return false end
+    return t0<=t1
+end
+local function losClear(p0,p1,rects,inflate)
+    local inf = inflate or 0
+    for i=1,#rects do
+        local r=rects[i]
+        local bmin=Vector3.new(r.minX-inf,0,r.minZ-inf)
+        local bmax=Vector3.new(r.maxX+inf,0,r.maxZ+inf)
+        if segHitsAABB(p0,p1,bmin,bmax) then return false end
+    end
+    return true
+end
+
+-- Rect helpers ----------------------------------------------------------------
+local function clamp2(x,a,b) return (x<a and a) or (x>b and b) or x end
+local function nearestOnRectXZ(p, r)
+    local qx = clamp2(p.X, r.minX, r.maxX)
+    local qz = clamp2(p.Z, r.minZ, r.maxZ)
+    local q = Vector3.new(qx, p.Y, qz)
+    local sep = planar(p - q)
+    return q, sep
+end
+local function nearestOnRectFace(px, pz, r)
+    local x = clamp2(px, r.minX, r.maxX)
+    local z = clamp2(pz, r.minZ, r.maxZ)
+    local dxL = math.abs(px - r.minX)
+    local dxR = math.abs(r.maxX - px)
+    local dzB = math.abs(pz - r.minZ)
+    local dzT = math.abs(r.maxZ - pz)
+    local m = math.min(dxL, dxR, dzB, dzT)
+    if m==dxL then return Vector3.new(r.minX, 0, z), Vector3.new(-1,0,0), "L"
+    elseif m==dxR then return Vector3.new(r.maxX, 0, z), Vector3.new( 1,0,0), "R"
+    elseif m==dzB then return Vector3.new(x, 0, r.minZ), Vector3.new(0,0,-1), "B"
+    else                 return Vector3.new(x, 0, r.maxZ), Vector3.new(0,0, 1), "T" end
+end
+local function nearCorner(px,pz,r, eps)
+    local c1 = Vector3.new(r.minX,0,r.minZ)
+    local c2 = Vector3.new(r.minX,0,r.maxZ)
+    local c3 = Vector3.new(r.maxX,0,r.minZ)
+    local c4 = Vector3.new(r.maxX,0,r.maxZ)
+    local function d2(a) local dx=px-a.X; local dz=pz-a.Z; return math.sqrt(dx*dx+dz*dz) end
+    local d1,d2v,d3,d4 = d2(c1),d2(c2),d2(c3),d2(c4)
+    local m = math.min(d1,d2v,d3,d4)
+    if m<=eps then
+        if m==d1 then return c1,"LB"
+        elseif m==d2v then return c2,"LT"
+        elseif m==d3 then return c3,"RB"
+        else return c4,"RT" end
+    end
+    return nil,nil
+end
+
+-- Arena/map harvest -----------------------------------------------------------
+local function getArenaModel(hrp)
+    local arenas = Workspace:FindFirstChild("Arenas")
+    if not arenas then return nil end
+    local p = hrp.Position
+    local best,bd=nil,1e9
+    for _,a in ipairs(arenas:GetChildren()) do
+        local map = a:FindFirstChild("Map")
+        if map and map:IsA("Model") then
+            local cf,sz = map:GetBoundingBox()
+            local minX,maxX = (cf.Position.X - sz.X/2), (cf.Position.X + sz.X/2)
+            local minZ,maxZ = (cf.Position.Z - sz.Z/2), (cf.Position.Z + sz.Z/2)
+            if p.X>=minX and p.X<=maxX and p.Z>=minZ and p.Z<=maxZ then
+                local d = (Vector3.new(clamp(p.X,minX,maxX), p.Y, clamp(p.Z,minZ,maxZ)) - p).Magnitude
+                if d<bd then bd=d; best=a end
+            end
+        end
+    end
+    return best
+end
+local function collectRects(arena)
+    local rects = {}
+    if not arena then return rects end
+    local map = arena:FindFirstChild("Map"); if not map then return rects end
+    local function harvestFolder(folder, extra)
+        if not folder then return end
+        for _,d in ipairs(folder:GetDescendants()) do
+            if d:IsA("BasePart") and d.CanCollide and d.Anchored then
+                local cf = d.CFrame; local half = d.Size*0.5
+                local corners = {
+                    Vector3.new( half.X,  half.Y,  half.Z),
+                    Vector3.new( half.X,  half.Y, -half.Z),
+                    Vector3.new( half.X, -half.Y,  half.Z),
+                    Vector3.new( half.X, -half.Y, -half.Z),
+                    Vector3.new(-half.X,  half.Y,  half.Z),
+                    Vector3.new(-half.X,  half.Y, -half.Z),
+                    Vector3.new(-half.X, -half.Y,  half.Z),
+                    Vector3.new(-half.X, -half.Y, -half.Z),
+                }
+                local minX,maxX,minZ,maxZ = math.huge,-math.huge,math.huge,-math.huge
+                for _,cc in ipairs(corners) do
+                    local w = cf:PointToWorldSpace(cc)
+                    minX = math.min(minX,w.X); maxX = math.max(maxX,w.X)
+                    minZ = math.min(minZ,w.Z); maxZ = math.max(maxZ,w.Z)
+                end
+                local inflate = CFG.AgentRadius + CFG.InflateEps + (extra or 0)
+                table.insert(rects, {minX=minX-inflate, maxX=maxX+inflate, minZ=minZ-inflate, maxZ=maxZ+inflate})
+            end
+        end
+    end
+    harvestFolder(map:FindFirstChild("Wall"),  CFG.WallExtra)
+    harvestFolder(map:FindFirstChild("Brick"), CFG.BrickExtra)
+    tagprint("OBST", "# rects", #rects)
+    return rects
+end
+
+-- Visibility graph ------------------------------------------------------------
+local function cornersFromRects(rects)
+    local pts = {}
+    for _,r in ipairs(rects) do
+        table.insert(pts, Vector3.new(r.minX,0,r.minZ))
+        table.insert(pts, Vector3.new(r.minX,0,r.maxZ))
+        table.insert(pts, Vector3.new(r.maxX,0,r.minZ))
+        table.insert(pts, Vector3.new(r.maxX,0,r.maxZ))
+    end
+    return pts
+end
+local function buildVG(startPos, goalPos, rects)
+    local nodes = {}
+    local base = cornersFromRects(rects)
+    for i=1,#base do nodes[#nodes+1]=base[i] end
+    nodes[#nodes+1] = startPos
+    nodes[#nodes+1] = goalPos
+    local adj = {}
+    for i=1,#nodes do adj[i]={} end
+    for i=1,#nodes do
+        for j=i+1,#nodes do
+            local a,b = nodes[i], nodes[j]
+            if losClear(a,b,rects, 0) then
+                local w = (a-b).Magnitude
+                table.insert(adj[i], {j, w})
+                table.insert(adj[j], {i, w})
+            end
+        end
+    end
+    return nodes, adj
+end
+local function nearestIdx(nodes, p)
+    local bi,bd=1,1e9
+    for i=1,#nodes do local d=(nodes[i]-p).Magnitude if d<bd then bd=d; bi=i end end
+    return bi
+end
+local function aStar(nodes, adj, sIdx, gIdx)
+    local open = {[sIdx]=true}
+    local g = {[sIdx]=0}; local f = {}
+    local came = {}
+    local function H(i) return (nodes[i]-nodes[gIdx]).Magnitude end
+    f[sIdx] = H(sIdx)
+    while true do
+        local cur, bestF = nil, math.huge
+        for i,_ in pairs(open) do if f[i] and f[i]<bestF then bestF=f[i]; cur=i end end
+        if not cur then break end
+        open[cur]=nil
+        if cur==gIdx then break end
+        for _,e in ipairs(adj[cur]) do
+            local nb, w = e[1], e[2]
+            local t = (g[cur] or math.huge) + w
+            if t < (g[nb] or math.huge) then
+                g[nb]=t; f[nb]=t + H(nb); came[nb]=cur; open[nb]=true
+            end
+        end
+    end
+    if not came[gIdx] then return {nodes[sIdx], nodes[gIdx]} end
+    local path = {gIdx}; local k=gIdx; local guard=0
+    while k ~= sIdx do k=came[k]; table.insert(path,1,k); guard=guard+1; if guard>4096 then break end end
+    local pts={}; for _,i in ipairs(path) do pts[#pts+1]=nodes[i] end
+    return pts
+end
+local function smoothVisible(path, rects)
+    if #path<=2 then return path end
+    local out={path[1]}; local i=1
+    while i<#path do
+        local j=#path
+        while j>i+1 do
+            if losClear(path[i], path[j], rects, 0) then break end
+            j=j-1
+        end
+        table.insert(out, path[j]); i=j
+    end
+    return out
+end
+local function filletCorners(path)
+    if #path<=2 then return path end
+    local out={path[1]}
+    for k=2,#path-1 do
+        local a=path[k-1]; local b=path[k]; local c=path[k+1]
+        local ab = norm(planar(b-a)); local cb = norm(planar(b-c))
+        if ab.Magnitude<1e-6 or cb.Magnitude<1e-6 then
+            table.insert(out,b)
+        else
+            local r = CFG.FilletExtra
+            local p1 = b - ab * r
+            local p2 = b - cb * r
+            table.insert(out, p1); table.insert(out, p2)
+        end
+    end
+    table.insert(out, path[#path])
+    return out
+end
+
+-- Farthest visible point along path ------------------------------------------
+local function farthestVisibleCarrot(poly, p, ahead, rects)
+    if #poly==0 then return p end
+    local bestI, bestD = 1, 1e9
+    for i=1,#poly do local d=(poly[i]-p).Magnitude if d<bestD then bestD=d; bestI=i end end
+    local target = poly[bestI]
+    local remain = ahead
+    local i=bestI
+    while i < #poly do
+        local seg = poly[i+1]-poly[i]; local L = seg.Magnitude
+        if remain <= L then
+            local dir = norm(planar(seg))
+            target = poly[i] + Vector3.new(dir.X*remain, 0, dir.Z*remain)
+            break
+        else
+            remain = remain - L; i = i + 1; target = poly[i]
+        end
+    end
+    if not losClear(p, target, rects, 0) then
+        local step = math.max(CFG.CarrotLoSTryStep, 0.5)
+        local tries = math.ceil((target - p).Magnitude / step) + 1
+        local cur = target
+        for _=1,tries do
+            local dir = norm(planar(cur - p))
+            cur = Vector3.new(cur.X - dir.X*step, cur.Y, cur.Z - dir.Z*step)
+            if losClear(p, cur, rects, 0) then target = cur; break end
+        end
+    end
+    return target
+end
+
+-- Bomb & players --------------------------------------------------------------
+local BOMB_SET = { Bomb=true, TimeBomb=true, HotPotato=true, Potato=true, BombTool=true }
+local ARM_NAMES = {"RightHand","RightLowerArm","RightUpperArm","Right Arm","LeftHand","LeftLowerArm","LeftUpperArm","Left Arm"}
+
+local function isFriendlyChar(model)
+    local p = Players:GetPlayerFromCharacter(model)
+    if not p then return false end
+    local myTeam = LP and LP.Team or nil
+    return myTeam ~= nil and p.Team == myTeam
+end
+local function charHasBombTool(char)
+    for n,_ in pairs(BOMB_SET) do
+        local t = char:FindFirstChild(n)
+        if t and t:IsA("Tool") then return t end
+    end
+    return nil
+end
+local function readBombSeconds(char)
+    local tool = charHasBombTool(char); if not tool then return nil end
+    local best
+    for _,d in ipairs(tool:GetDescendants()) do
+        if (d.Name=="TimeLeft" or d.Name=="Timer" or d.Name=="Time" or d.Name=="Counter") then
+            if d:IsA("TextLabel") or d:IsA("TextBox") then
+                local txt = d.Text or ""
+                local num = tonumber((txt:match("([%d%.]+)")))
+                best = best or num
+            elseif d:IsA("NumberValue") then
+                best = best or d.Value
+            elseif d:IsA("StringValue") then
+                local num = tonumber(d.Value); best = best or num
+            end
+        end
+    end
+    return best
+end
+local function holdingBomb(char)
+    if charHasBombTool(char) then return true end
+    local bp = LP:FindFirstChild("Backpack")
+    if bp then for n,_ in pairs(BOMB_SET) do if bp:FindFirstChild(n) then return true end end end
+    for n,_ in pairs(BOMB_SET) do if char:FindFirstChild(n) then return true end end
+    return false
+end
+local function pickEnemy(myChar)
+    local myHRP = myChar:FindFirstChild("HumanoidRootPart"); if not myHRP then return nil end
+    local best,bd=nil,1e9
+    local root = Workspace:FindFirstChild("Characters") or Workspace
+    for _,m in ipairs(root:GetChildren()) do
+        if m:IsA("Model") and m~=myChar and not isFriendlyChar(m) then
+            local h=m:FindFirstChildOfClass("Humanoid")
+            local r=m:FindFirstChild("HumanoidRootPart")
+            if h and h.Health>0 and r then
+                local d=(r.Position - myHRP.Position).Magnitude
+                if d<bd then bd=d; best=m end
+            end
+        end
+    end
+    return best
+end
+local function getRightArmPos(model)
+    local order = {"RightHand","RightLowerArm","RightUpperArm","Right Arm"}
+    for _,n in ipairs(order) do local p=model:FindFirstChild(n); if p and p:IsA("BasePart") then return p.Position end end
+    local hrp = model:FindFirstChild("HumanoidRootPart"); return hrp and hrp.Position or nil
+end
+local function enemyArmOrRootPos(enemy)
+    local best,bd=nil,1e9
+    local hrp = enemy:FindFirstChild("HumanoidRootPart")
+    if hrp then best = hrp.Position; bd = 1e9 end
+    for _,n in ipairs(ARM_NAMES) do
+        local p=enemy:FindFirstChild(n)
+        if p and p:IsA("BasePart") then
+            local d = (p.Position - (hrp and hrp.Position or p.Position)).Magnitude
+            if d<bd then bd=d; best=p.Position end
+        end
+    end
+    return best or (hrp and hrp.Position or nil)
+end
+
+-- Prediction for guarding
+local lastEnemyPos=nil; local lastEnemyT=0
+local function predictDirToEnemy(hrp, enemy)
+    local eHRP = enemy and enemy:FindFirstChild("HumanoidRootPart") or nil
+    if not eHRP then return nil end
+    local t = now()
+    local vel = Vector3.new(0,0,0)
+    if lastEnemyPos then
+        local dt = math.max(t - lastEnemyT, 1/240)
+        vel = (eHRP.Position - lastEnemyPos) / dt
+    end
+    lastEnemyPos = eHRP.Position; lastEnemyT = t
+    local dist = (eHRP.Position - hrp.Position).Magnitude
+    local horizon = clamp(CFG.GuardPredictMin + 0.15*(dist/24), CFG.GuardPredictMin, CFG.GuardPredictMax)
+    local pred = eHRP.Position + vel * horizon
+    return norm(planar(pred - hrp.Position)), pred
+end
+
+-- Look such that hrp.RightVector == r (XZ)
+local function lookPointWithRight(hrp, r, ahead)
+    local up = Vector3.new(0,1,0)
+    local L = up:Cross(r) -- LookVector so that Right = Look × Up = r
+    if L.Magnitude < 1e-6 then L = norm(planar(hrp.CFrame.LookVector)) end
+    L = norm(L)
+    return hrp.Position + L * ahead
+end
+
+-- Behavior / Goals ------------------------------------------------------------
+local orbitSide, lastOrbitSwitch = 1, 0
+local lastGoal = nil
+
+local function chooseGoal(myChar, enemy, rects, deliverSoon)
+    local hrp = myChar:FindFirstChild("HumanoidRootPart"); if not hrp then return nil end
+    local me = hrp.Position
+    local eHRP = enemy and enemy:FindFirstChild("HumanoidRootPart") or nil
+    if not eHRP then return me end
+    local enemyPos = eHRP.Position
+    local dist = (enemyPos - me).Magnitude
+    local enemyHas = holdingBomb(enemy)
+    local iHave    = holdingBomb(myChar)
+
+    if iHave then
+        if deliverSoon then
+            local radial = norm( planar(me - enemyPos) )
+            return enemyPos + radial * 0.6  -- get very close for handoff
+        end
+        local myRight = (hrp.CFrame.RightVector)
+        local toE = norm(planar(enemyPos - me))
+        local radial = norm( planar(me - enemyPos) )
+        local tang = Vector3.new(-radial.Z,0,radial.X) * 0.55 * orbitSide
+        -- keep our right side AWAY from enemy: if enemy on right, bias clockwise orbit; else ccw
+        local onRight = myRight:Dot(toE) > 0
+        orbitSide = onRight and -1 or 1
+        return enemyPos + radial * 4.2 + tang
+    else
+        if enemyHas then
+            local away = norm(planar(me - enemyPos))
+            return me + away * clamp(CFG.KiteMaxRange - math.min(dist, CFG.KiteMaxRange-2), 4, CFG.KiteMaxRange)
+        else
+            if dist < CFG.KiteMinRange then
+                local away = norm(planar(me - enemyPos))
+                return me + away*(CFG.KiteMaxRange - dist)
+            else
+                local away = norm(planar(me - enemyPos))
+                local side = Vector3.new(-away.Z,0,away.X)
+                return me + away*2 + side*(math.random()-0.5)*6
+            end
+        end
+    end
+end
+
+-- Movement state --------------------------------------------------------------
+local enabled=true
+local myChar, HUM = nil, nil
+local arena, rects = nil, {}
+local lastPlan=0
+local path={}
+local carrot=Vector3.new()
+local lastPos = nil
+local breakoutT=0; local breakoutDir=Vector3.new()
+local BF = {active=false, rectI=0, cw=true, since=0}
+local lastSideLockT = 0
+local lastSideCW = true
+
+local function ensureChar()
+    local c=LP.Character or LP.CharacterAdded:Wait()
+    local h=c:FindFirstChildOfClass("Humanoid") or c:WaitForChild("Humanoid")
+    return c,h
+end
+local function rebind()
+    myChar, HUM = ensureChar()
+    HUM.AutoRotate=false
+    HUM:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+    HUM:ChangeState(Enum.HumanoidStateType.Running)
+end
+rebind()
+LP.CharacterAdded:Connect(function() task.wait(0.2); rebind() end)
+
+-- Planning
+local function planFromTo(startPos, goalPos)
+    arena = getArenaModel(myChar:FindFirstChild("HumanoidRootPart"))
+    rects = collectRects(arena)
+    local nodes,adj = buildVG(startPos, goalPos, rects)
+    local sIdx = nearestIdx(nodes, startPos); local gIdx = nearestIdx(nodes, goalPos)
+    local pts = aStar(nodes, adj, sIdx, gIdx)
+    pts = smoothVisible(pts, rects)
+    pts = filletCorners(pts)
+    lastPlan = now()
+    tagprint("PLAN","path points", #pts)
+    return pts
+end
+
+-- Steering fields -------------------------------------------------------------
+local function repulsion(p)
+    local R = Vector3.new(0,0,0)
+    for i=1,#rects do
+        local q, sep = nearestOnRectXZ(p, rects[i])
+        local d = sep.Magnitude
+        if d < CFG.RepelRadius and d > 1e-4 then
+            local g = (CFG.RepelRadius - d)/CFG.RepelRadius
+            R = R + norm(sep) * (g * CFG.RepelGain)
+        end
+    end
+    return R
+end
+local function probeSteer(hrp, dir)
+    local origin = hrp.Position + Vector3.new(0,2.5,0)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = {myChar}
+    rp.IgnoreWater=true
+    local hitF = Workspace:Raycast(origin, dir*CFG.ProbeLen, rp)
+    if hitF then
+        local left = Vector3.new(-dir.Z,0,dir.X); local right = -left
+        local lHit = Workspace:Raycast(origin, left*CFG.ProbeLen*0.7, rp) ~= nil
+        local rHit = Workspace:Raycast(origin, right*CFG.ProbeLen*0.7, rp) ~= nil
+        tagprint("STEER","avoid L/R", lHit, rHit)
+        if lHit and not rHit then return norm(dir + right*CFG.ProbeBias)
+        elseif rHit and not lHit then return norm(dir + left*CFG.ProbeBias)
+        else return norm(dir + right*0.25 + left*0.25) end
+    end
+    return dir
+end
+local function fanEscape(hrp, goal)
+    local p = hrp.Position
+    local bestDir, bestScore=nil,-1e9
+    for k=0,CFG.FanRays-1 do
+        local ang = (2*math.pi) * (k/CFG.FanRays)
+        local d = Vector3.new(math.cos(ang),0,math.sin(ang))
+        local endp = p + d*CFG.FanLen
+        local clear = losClear(p, endp, rects, 0)
+        if clear then
+            local score = (norm(d):Dot(norm(planar(goal - p))) * 0.7) + 0.3
+            if score>bestScore then bestScore=score; bestDir=d end
+        end
+    end
+    return bestDir or Vector3.new(1,0,0)
+end
+
+-- Boundary follow -------------------------------------------------------------
+local function engageBoundaryIfNeeded(hrp, dir, goal)
+    local pos = hrp.Position
+    local bestI, bd = 0, 1e9
+    for i,r in ipairs(rects) do
+        local _,sep = nearestOnRectXZ(pos, r)
+        local d = sep.Magnitude
+        if d < bd then bd = d; bestI = i end
+    end
+    if bd < CFG.FaceStickR then
+        local r = rects[bestI]
+        local _,_, side = nearestOnRectFace(pos.X, pos.Z, r)
+        local tCW, tCCW
+        if side=="L" or side=="R" then
+            tCW  = Vector3.new(0,0, 1); tCCW = Vector3.new(0,0,-1)
+        else
+            tCW  = Vector3.new(-1,0,0); tCCW = Vector3.new( 1,0,0)
+        end
+        local toGoal = norm(planar(goal - pos))
+        local cwScore  = toGoal:Dot(tCW)
+        local ccwScore = toGoal:Dot(tCCW)
+        local cw = cwScore >= ccwScore
+        if (now() - lastSideLockT) < CFG.PathHysteresisS then cw = lastSideCW else lastSideCW = cw; lastSideLockT = now() end
+        BF.active=true; BF.rectI=bestI; BF.cw=cw; BF.since=now()
+        tagprint("BOUND","engage rect", bestI, "cw", cw)
+        return true
+    end
+    return false
+end
+local function boundaryStep(hrp, goal)
+    if not BF.active then return nil end
+    local r = rects[BF.rectI]; if not r then BF.active=false; return nil end
+    local pos = hrp.Position
+    local nearP, nrm, which = nearestOnRectFace(pos.X, pos.Z, r)
+    local t
+    if which=="L" or which=="R" then t = Vector3.new(0,0, BF.cw and 1 or -1)
+    else                            t = Vector3.new(BF.cw and -1 or 1, 0, 0) end
+    local crn,_ = nearCorner(pos.X, pos.Z, r, CFG.CornerStickR)
+    if crn then
+        local sx = (crn.X < (r.minX+r.maxX)/2) and -1 or 1
+        local sz = (crn.Z < (r.minZ+r.maxZ)/2) and -1 or 1
+        local R = CFG.AgentRadius + CFG.FilletExtra + 0.35
+        local around = Vector3.new(crn.X + sx*R, pos.Y, crn.Z + sz*R)
+        tagprint("PLAN","apex around", string.format("(%.1f,%.1f)", around.X, around.Z))
+        return around
+    end
+    local ahead = nearP + t * math.max(CFG.LookAheadMin*0.6, 3.0)
+    local outward = nearP + nrm * (CFG.AgentRadius + CFG.InflateEps + 0.35)
+    local carrotB = (ahead + outward) * 0.5
+    if losClear(pos, goal, rects, 0) then BF.active=false end
+    return carrotB
+end
+
+-- Threat evaluation for bomb guard -------------------------------------------
+local function guardThreat(hrp, enemy)
+    local eHRP = enemy and enemy:FindFirstChild("HumanoidRootPart") or nil
+    if not eHRP then return 0,false,Vector3.new(),nil end
+    local myRight = hrp.CFrame.RightVector
+    local toEnemyDir, pred = predictDirToEnemy(hrp, enemy)
+    local toE = toEnemyDir or norm(planar(eHRP.Position - hrp.Position))
+    local onRight = myRight:Dot(toE) -- >0 => enemy is on our right side
+    local coneOk = onRight > CFG.GuardConeCos
+    local myRArm = getRightArmPos(myChar) or hrp.Position
+    local eArm   = enemyArmOrRootPos(enemy) or eHRP.Position
+    local dist   = (Vector3.new(eArm.X, myRArm.Y, eArm.Z) - Vector3.new(myRArm.X, myRArm.Y, myRArm.Z)).Magnitude
+    local thresh = 2.2 + CFG.ThreatPad -- tuned; includes HRP/arm hitboxes
+    local isThreat = coneOk and (dist < thresh)
+    return dist, isThreat, toE, pred
+end
+
+-- Update ----------------------------------------------------------------------
+local lastGoalBlend=nil
+local function update(dt)
+    if not enabled then return end
+    if not myChar or not HUM then return end
+    local hrp = myChar:FindFirstChild("HumanoidRootPart"); if not hrp then return end
+
+    if CFG.TryUnanchor and hrp.Anchored then hrp.Anchored=false; tagprint("WARN","unanchored HRP") end
+
+    -- Enemy/bomb state
+    local enemy = pickEnemy(myChar)
+    local secs = readBombSeconds(myChar)
+    local iHave = holdingBomb(myChar)
+    local deliverSoon = iHave and (secs and (secs <= CFG.DeliverThreshold))
+
+    -- Goal selection with light temporal smoothing
+    local rawGoal = chooseGoal(myChar, enemy, rects, deliverSoon) or hrp.Position
+    if lastGoal then
+        local gblend = 0.35
+        rawGoal = Vector3.new(lastGoal.X*(1-gblend)+rawGoal.X*gblend, hrp.Position.Y, lastGoal.Z*(1-gblend)+rawGoal.Z*gblend)
+    end
+    lastGoal = rawGoal
+    local goal = rawGoal
+
+    -- Plan if needed
+    local needReplan = false
+    if (now()-lastPlan) > CFG.ReplanMax then
+        needReplan = true
+    elseif (now()-lastPlan) > CFG.ReplanMin and not losClear(hrp.Position, goal, rects, 0) then
+        needReplan = true
+    end
+    if needReplan or #path==0 then path = planFromTo(hrp.Position, goal) end
+
+    -- Carrot and boundary
+    local baseAhead = clamp(CFG.CarrotDist, CFG.LookAheadMin, CFG.LookAheadMax*1.2)
+    local carrotB = BF.active and boundaryStep(hrp, goal) or nil
+    if not carrotB then carrotB = farthestVisibleCarrot(path, hrp.Position, baseAhead, rects) end
+    carrot = carrotB or goal
+
+    if not BF.active then
+        local dirToCarrot = norm(planar(carrot - hrp.Position))
+        if not losClear(hrp.Position, carrot, rects, 0) then
+            engageBoundaryIfNeeded(hrp, dirToCarrot, goal)
+        else
+            local bestClr = 1e9
+            for i=1,#rects do local _,sep=nearestOnRectXZ(hrp.Position, rects[i]); local d=sep.Magnitude; if d<bestClr then bestClr=d end end
+            if bestClr < CFG.FaceStickR then engageBoundaryIfNeeded(hrp, dirToCarrot, goal) end
+        end
+    end
+
+    -- Steering direction (with repulsion and probes)
+    local dir = norm(planar(carrot - hrp.Position))
+    dir = norm(dir + repulsion(hrp.Position))
+    dir = probeSteer(hrp, dir)
+
+    -- Stuck / wedge escape
+    local progress = 0
+    if lastPos then progress = (hrp.Position - lastPos).Magnitude end
+    lastPos = hrp.Position
+    local minClr = 1e9
+    for i=1,#rects do local _,sep=nearestOnRectXZ(hrp.Position, rects[i]); local d=sep.Magnitude; if d<minClr then minClr=d end end
+    if progress < CFG.MinProgress or minClr < CFG.CornerStickR then
+        breakoutDir = fanEscape(hrp, goal); breakoutT = CFG.EscapePulseSec
+        tagprint("FREE","breakout minClr=", string.format("%.2f",minClr))
+    end
+    if breakoutT > 0 then breakoutT = breakoutT - dt; dir = norm(dir*0.4 + breakoutDir*0.6) end
+
+    -- Movement
+    if CFG.UseMoveFallback then HUM:Move(dir, true) end
+    local movePoint = hrp.Position + dir*CFG.MoveStep
+    pcall(function() HUM:MoveTo(movePoint) end)
+    HUM:ChangeState(Enum.HumanoidStateType.Running)
+
+    -- ===== Yaw & Guard/Deliver control =====
+    local lookPoint
+    local lookAhead = clamp(CFG.LookAheadMin + (HUM and HUM.WalkSpeed or 16)*0.12, CFG.LookAheadMin, CFG.LookAheadMax)
+
+    local bias = nil
+    if enemy and iHave then
+        local dist, threat, toE, pred = guardThreat(hrp, enemy)
+
+        if deliverSoon then
+            -- Align right arm TOWARD enemy for handoff; close in.
+            local r = toE
+            lookPoint = lookPointWithRight(hrp, r, lookAhead)
+            bias = 1.0
+            -- tighten pursuit carrot
+            carrot = farthestVisibleCarrot(path, hrp.Position, math.max(5.5, CFG.LookAheadMin), rects)
+            tagprint("BOMB","deliver ≤2s", string.format("t=%.2f d=%.1f", secs or -1, dist))
+        else
+            -- Strong guard: keep RIGHT away, instant reaction if threat on right
+            local awayR = Vector3.new(-toE.X, 0, -toE.Z) -- right should point opposite enemy
+            local pathRight = Vector3.new(dir.Z,0,-dir.X)
+            local r = norm(awayR*0.85 + pathRight*0.15)
+
+            if threat then
+                -- Panic: yaw almost fully devoted to swinging right side away immediately.
+                local side = sgn(hrp.CFrame.RightVector:Dot(toE)) -- +1 means enemy on right
+                local sideVec = Vector3.new(-toE.Z,0,toE.X) * (-side) -- step further to hide arm
+                r = norm(awayR*0.90 + sideVec*0.55)
+                dir = norm(dir + sideVec*0.45) -- sidestep
+                bias = CFG.InstantYawBias
+                tagprint("THREAT","panic guard", "dist", string.format("%.2f",dist), "side", side)
+            end
+
+            lookPoint = lookPointWithRight(hrp, r, lookAhead)
+            tagprint("BOMB","guard", "d=", string.format("%.2f",dist), "secs=", secs and string.format("%.2f",secs) or "?")
+        end
+    else
+        -- No bomb: look with movement
+        local forward = norm(dir)
+        lookPoint = hrp.Position + forward * lookAhead
+    end
+
+    -- Apply yaw
+    yawTo(hrp, lookPoint, dt, bias)
+
+    -- Debug final
+    tagprint("MOVE","carrot=("..string.format("%.1f,%.1f", carrot.X, carrot.Z)..")", "phase=", (iHave and (deliverSoon and "DELIVER" or "GUARD") or "SEEK"))
+end
+
+-- Input / toggle --------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(i,g)
+    if g then return end
+    if i.KeyCode==Enum.KeyCode.R then
+        enabled = not enabled
+        print(("[TB-AI v44+] %s"):format(enabled and "ON" or "OFF"))
+        if HUM then HUM.AutoRotate = not enabled end -- re-enable AutoRotate when we turn OFF
+        if not enabled and HUM then HUM:Move(Vector3.new()) end
+    elseif i.KeyCode==Enum.KeyCode.F8 then
+        DBG.on = not DBG.on
+        print("[TB-AI v44+] logs:", DBG.on and "ON" or "OFF")
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    local ok,err = pcall(function() update(dt) end)
+    if not ok then oops("Heartbeat", err) end
+end)
+
+print("[TB-AI] v44_ARMGUARD_TIMER_GUARDPLUS loaded — VG+fillet+pursuit, boundary follow, wedge escape, predictive bomb guarding and 2s deliver. (R=toggle, F8=logs)")
